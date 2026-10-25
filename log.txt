@@ -1,0 +1,836 @@
+================================================================================
+  GHOST-AUDIT — NORTHSTAR SHOP DELETION AUDIT AGENT
+  Competition Chat Transcript & Project Analysis Log
+  HackerRank Orchestrate Challenge — October 2026
+================================================================================
+Generated : 2026-10-25T15:08:00Z
+Candidate : Mallikarjun Arjun
+Project   : ghost-audit/
+Submission: code.zip + output.csv + log.txt
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+  1.  Problem Statement Summary
+  2.  Architecture Overview
+  3.  Module-by-Module Analysis
+  4.  Dataset Summary
+  5.  Deletion Rules Interpretation
+  6.  Pipeline Walk-Through (Step-by-Step)
+  7.  Design Decisions & Rationale
+  8.  Test Results
+  9.  LLM Strategy
+  10. Output Format Specification
+  11. Known Limitations & Edge Cases
+  12. File Listing
+
+================================================================================
+1. PROBLEM STATEMENT SUMMARY
+================================================================================
+
+Northstar Shop (fictional e-commerce company) receives deletion requests from
+customers under GDPR Article 17, CCPA, and internal privacy policies.
+
+INPUT  : dataset/deletion_requests.csv — 518 cases
+         Each row: case_id, email, request_text, requested_at, audit_at
+
+OUTPUT : output.csv — one row per case
+         Columns: case_id, deletion_status, steps_json
+
+DELETION STATUS VALUES:
+  NOT_APPLICABLE  — Customer did not request deletion (data export, question, etc.)
+                    steps_json = []
+
+  COMPLETE        — All required deletions confirmed done at audit_at
+                    steps_json contains ONLY VERIFICATION steps, each with a
+                    real evidence_id (file_id / activity_id / audit_id)
+
+  INCOMPLETE      — Gaps found: records still present, PII exposed, active
+                    data flows, or restore risks exist
+                    steps_json contains FINDING (evidence_id filled) +
+                    REMEDIATION (evidence_id = "") + VERIFICATION (evidence_id = "")
+
+STEP SCHEMA:
+  { step_no, phase, system_id, resource_id, operation, state, evidence_id }
+
+ALLOWED (phase, operation, state) COMBINATIONS:
+  FINDING:
+    REPORT_REMAINING_RECORD / PRESENT
+    REPORT_EXPOSED_PII       / PRESENT
+    REPORT_ACTIVE_DATA_FLOW  / ACTIVE
+    REPORT_RESTORE_RISK      / ACTIVE
+
+  REMEDIATION:
+    DISABLE_DATA_FLOW  / DISABLED
+    BLOCK_RESTORE      / BLOCKED
+    DELETE_RECORD      / ABSENT
+    REDACT_RECORD      / REDACTED
+    ANONYMIZE_RECORD   / ANONYMIZED
+
+  VERIFICATION:
+    VERIFY_RECORD_ABSENT       / ABSENT
+    VERIFY_RECORD_PRESENT      / PRESENT
+    VERIFY_RECORD_REDACTED     / REDACTED
+    VERIFY_RECORD_ANONYMIZED   / ANONYMIZED
+    VERIFY_DATA_FLOW_DISABLED  / DISABLED
+    VERIFY_RESTORE_BLOCKED     / BLOCKED
+
+STEP ORDERING RULES:
+  1. Phase order: FINDING → REMEDIATION → VERIFICATION
+  2. Within phase: operation order (per table above)
+  3. Then: system_id ascending
+  4. Then: resource_id ascending
+  5. step_no starts at 1 and is consecutive
+
+TOMBSTONE RULE:
+  A tombstone record may retain user_id ONLY.
+  It must NOT contain: name, email, phone, email_hash, full_name,
+                       display_name, email_address
+
+RETAINED RECORDS:
+  Some systems require records to be kept (e.g., invoices for 7 years).
+  Even retained records must not expose forbidden PII unless explicitly
+  listed in permitted_identifiers in deletion_rules.csv.
+
+================================================================================
+2. ARCHITECTURE OVERVIEW
+================================================================================
+
+ghost-audit/ uses a deterministic multi-stage pipeline with LLM only as a
+fallback for genuinely ambiguous cases.
+
+  PIPELINE (per case):
+  ┌─────────────────┐
+  │ load_data.py    │  Load & normalise all 8 CSVs into DataBundle
+  └────────┬────────┘
+           │
+  ┌────────▼────────┐
+  │ intent.py       │  Stage-1: regex keyword rules (deterministic)
+  │                 │  Stage-2: LLM via llm.py (only if confidence < 0.80
+  │                 │           or conflicting signals)
+  └────────┬────────┘
+           │ NOT_APPLICABLE → output []
+           │
+  ┌────────▼────────┐
+  │ identity.py     │  Resolve email → user_id + all identifier variants
+  │                 │  (current email, historical emails, phone, name,
+  │                 │   MD5/SHA-256/SHA-1 hashes, plus-address variants)
+  └────────┬────────┘
+           │
+  ┌────────▼────────┐
+  │ evidence.py     │  Search all evidence files for any identifier match
+  │                 │  SQLite / JSON / CSV / PDF / image / txt / log
+  │                 │  OCR fallback; vision LLM for low-confidence images
+  └────────┬────────┘
+           │
+  ┌────────▼────────┐
+  │ state.py        │  Replay system_activity.csv chronologically up to audit_at
+  │                 │  Cross-check DELETE claims with evidence
+  │                 │  Detect SYNC/BACKUP/RESTORE risks
+  └────────┬────────┘
+           │
+  ┌────────▼────────┐
+  │ rules.py        │  Apply deletion_rules.csv to each resource state
+  │                 │  Generate Gap records (REMAINING_RECORD, EXPOSED_PII,
+  │                 │  ACTIVE_DATA_FLOW, RESTORE_RISK)
+  │                 │  Call decide_status() → COMPLETE / INCOMPLETE
+  └────────┬────────┘
+           │
+  ┌────────▼────────┐
+  │ steps.py        │  Build ordered step list from gaps + state_report
+  │                 │  De-duplicate, sort, renumber step_no
+  └────────┬────────┘
+           │
+  ┌────────▼────────┐
+  │ validate.py     │  12-rule schema + logic validation
+  └────────┬────────┘
+           │
+         output.csv
+
+KEY DESIGN PRINCIPLE:
+  Deterministic Python for everything verifiable.
+  LLM only for:
+    (a) Intent classification when regex confidence < 0.80
+    (b) Evidence extraction from PDFs/images with unstructured free text
+    (c) Vision extraction from low-confidence OCR images
+  All LLM calls are cached by SHA-256(model + system + prompt).
+  Every LLM call is logged to evaluation/llm_calls.jsonl.
+
+CONCURRENCY:
+  main.py uses ThreadPoolExecutor (default 4 workers).
+  Per-case errors fall back to INCOMPLETE with empty steps rather than
+  crashing the whole run.
+
+================================================================================
+3. MODULE-BY-MODULE ANALYSIS
+================================================================================
+
+── src/llm.py ─────────────────────────────────────────────────────────────────
+  Class   : LLMClient
+  Provider: Anthropic Claude (claude-claude-sonnet-4-5)
+  API key : ANTHROPIC_API_KEY env var ONLY — never in config or code
+  Cache   : .cache/llm/<sha256>.json (disk, persistent across runs)
+  Log     : evaluation/llm_calls.jsonl (model, tokens, latency, cache_hit)
+  Methods :
+    call(prompt, system)      → str   (raw text)
+    call_json(prompt, system) → dict  (parses JSON, strips markdown fences)
+  Cache key: SHA-256(model + "\x00" + system + "\x00" + prompt)
+
+── src/load_data.py ────────────────────────────────────────────────────────────
+  Returns : DataBundle dataclass with 8 DataFrames
+    .requests          deletion_requests.csv   (518 rows)
+    .sample_requests   sample_requests.csv
+    .sample_output     sample_output.csv
+    .identities        identities.csv
+    .audit_log         audit_log.csv
+    .activity          system_activity.csv
+    .rules             deletion_rules.csv
+    .evidence_manifest evidence_files.csv
+  Normalisation applied:
+    - Email columns: strip whitespace, lowercase
+    - Timestamp columns: pd.to_datetime(utc=True, errors="coerce") → NaT + warning
+    - Prints row counts and null counts per column on load
+
+── src/intent.py ───────────────────────────────────────────────────────────────
+  Stage 1 (deterministic regex):
+    12 positive patterns: delete/erase/purge/wipe/right-to-be-forgotten/GDPR/CCPA
+    14 negative patterns: export/download/access-request/do-not-delete/portability
+    Returns confidence 0.95 on clean match, 0.40 on conflict
+    Strong negation (do not delete / not delete) overrides positive patterns
+  Stage 2 (LLM fallback):
+    Called only when confidence < 0.80 OR conflict detected
+    Uses prompts/intent.txt with {{REQUEST_TEXT}} placeholder
+    Returns {"is_deletion": bool, "confidence": float, "reason": str}
+  Test coverage: 22/22 tests passing (100%)
+
+── src/identity.py ─────────────────────────────────────────────────────────────
+  Input : email (raw), requested_at, audit_at, identities df, audit_log df
+  Output: IdentityBundle dataclass
+    .user_id                  str | None
+    .current_identifiers      {emails, phones, names, email_hashes}
+    .historical_identifiers   same, from audit_log
+    .source_ids               list of audit_id / activity_id as evidence
+    .ambiguous                bool (True if email reassigned between users)
+    .ambiguity_note           explanation string
+    .all_identifiers          flat set of all PII tokens to search for
+  Steps:
+    1. Exact match in identities.csv (after plus-address normalisation)
+    2. Enrich from audit_log (catches historical emails, old names)
+    3. Detect reassignment ambiguity (same email, different user_id over time)
+    4. Compute MD5 / SHA-256 / SHA-1 hashes for each known email
+  Plus-address handling: user+tag@domain → user@domain before matching
+
+── src/evidence.py ─────────────────────────────────────────────────────────────
+  Input : IdentityBundle, evidence_manifest df, evidence_dir path
+  Output: list[EvidenceMatch]
+    .file_id, .system_id, .resource_id, .field, .matched_value, .raw_snippet
+  File type handlers:
+    .db / .sqlite  → in-memory sqlite3; enumerate all tables; search text cols
+    .json          → parse + recursive json.dumps; text search
+    .jsonl         → line-by-line parse; text search
+    .csv           → pandas read; search all str columns
+    .pdf           → pdfplumber text extraction; OCR fallback if empty
+    .png/.jpg/...  → pytesseract OCR; vision LLM if avg_conf < 60
+    .txt/.log/.md  → plain text search
+  Primary key inference: looks for "id", "<table>_id", "user_id", "record_id"
+  Disk cache: .cache/evidence/<filename>.txt (parsed text, reused across runs)
+  Unknown extensions: logged as WARNING, return [] (never raise)
+
+── src/state.py ────────────────────────────────────────────────────────────────
+  Input : IdentityBundle, audit_at, activity df, evidence_matches list
+  Output: StateReport
+    .resource_states  dict[(system_id, resource_id)] → ResourceState
+    .active_flows     list[ActiveFlow]   (SYNC/IMPORT still running at audit_at)
+    .restore_risks    list[RestoreRisk]  (BACKUP snapshots that can restore data)
+    .timeline         str (debug trace of all replayed events)
+  Replay logic:
+    - Events filtered to: user_id match OR any identifier in row; ts <= audit_at
+    - DELETE/PURGE → mark ABSENT, but cross-check with evidence:
+        if evidence still shows the identifier → override to PRESENT
+    - SYNC/IMPORT → if job active at audit_at OR ran after a DELETE → ACTIVE_FLOW
+    - BACKUP/SNAPSHOT → always add RestoreRisk
+    - RESTORE → mark PRESENT (data came back)
+    - DISABLE/DEACTIVATE → remove from active_flows list
+    - REDACT/ANONYMIZE → mark REDACTED / ANONYMIZED
+    - CREATE/UPDATE → mark PRESENT (if not already present)
+  Evidence fallback: if resource found in evidence but not in activity → PRESENT
+
+── src/rules.py ────────────────────────────────────────────────────────────────
+  required_treatment(system_id, resource_type, rules_df):
+    Looks up deletion_rules.csv; normalises column names
+    Returns: {action, permitted_identifiers, retention_days, tombstone_allowed}
+    Fallback: wildcard/default rows; default action = DELETE
+
+  evaluate(state_report, evidence_matches, identity, rules_df):
+    For each (system_id, resource_id) in state_report:
+      - Infer resource_type from name heuristics
+      - Look up required treatment
+      - RETAIN_AS_IS → add to retained list; check for forbidden PII → EXPOSED_PII gap
+      - DELETE + state PRESENT → REMAINING_RECORD gap
+      - REDACT/ANONYMIZE + state PRESENT → check for exposed PII → EXPOSED_PII gap
+      - tombstone_allowed + state PRESENT → check forbidden fields → EXPOSED_PII gap
+    For each active_flow  → ACTIVE_DATA_FLOW gap
+    For each restore_risk → RESTORE_RISK gap
+    Returns EvaluationResult(gaps, retained, deletion_status)
+
+  decide_status(intent, eval_result):
+    NOT is_deletion         → NOT_APPLICABLE
+    any gap exists          → INCOMPLETE
+    no gaps                 → COMPLETE
+
+  Tombstone forbidden fields: name, email, phone, email_hash,
+                               full_name, display_name, email_address
+  Tombstone permitted fields: user_id (only)
+
+── src/steps.py ────────────────────────────────────────────────────────────────
+  build_steps(deletion_status, gaps, retained, state_report):
+    NOT_APPLICABLE → []
+    COMPLETE       → VERIFICATION steps only; evidence_id = rs.activity_id (real)
+    INCOMPLETE     → FINDING (evidence_id filled) +
+                     REMEDIATION (evidence_id = "") +
+                     VERIFICATION (evidence_id = "")
+  Gap → Step mapping:
+    REMAINING_RECORD   → REPORT_REMAINING_RECORD / DELETE_RECORD / VERIFY_RECORD_ABSENT
+    EXPOSED_PII_REDACT → REPORT_EXPOSED_PII / REDACT_RECORD / VERIFY_RECORD_REDACTED
+    EXPOSED_PII_ANON   → REPORT_EXPOSED_PII / ANONYMIZE_RECORD / VERIFY_RECORD_ANONYMIZED
+    ACTIVE_DATA_FLOW   → REPORT_ACTIVE_DATA_FLOW / DISABLE_DATA_FLOW / VERIFY_DATA_FLOW_DISABLED
+    RESTORE_RISK       → REPORT_RESTORE_RISK / BLOCK_RESTORE / VERIFY_RESTORE_BLOCKED
+  De-duplication: same (phase, system_id, resource_id, operation) removed
+  Sort key: (_PHASE_ORDER, _OP_ORDER, system_id, resource_id)
+  Renumber: step_no = 1, 2, 3, ...
+
+── src/validate.py ─────────────────────────────────────────────────────────────
+  validate_output(output_path, requests_path) → list[str errors]
+  12 checks:
+    1.  Header exactly: case_id, deletion_status, steps_json
+    2.  Exactly one row per case in deletion_requests.csv
+    3.  deletion_status in {COMPLETE, INCOMPLETE, NOT_APPLICABLE}
+    4.  steps_json is valid JSON; NOT_APPLICABLE → []
+    5.  Every step has all 7 required keys
+    6.  (phase, operation, state) is an allowed combo
+    7.  step_no is 1..n consecutive
+    8.  Phases in order FINDING → REMEDIATION → VERIFICATION
+    9.  Sort order within each phase is correct
+    10. COMPLETE: only VERIFICATION steps; all have non-empty evidence_id
+    11. INCOMPLETE: FINDING has evidence_id; REMEDIATION/VERIFICATION have ""
+    12. Every REMEDIATION has matching FINDING and VERIFICATION
+
+── src/main.py ─────────────────────────────────────────────────────────────────
+  CLI flags:
+    --input    PATH   deletion_requests.csv (required)
+    --output   PATH   output CSV to write (required)
+    --limit    N      process first N cases only
+    --case-id  ID     process a single case
+    --config   PATH   override config.yaml location
+    --workers  N      ThreadPoolExecutor workers (default 4)
+    --no-validate     skip output validation step
+  Per-case errors: caught, logged, fall back to INCOMPLETE + empty steps
+  Output: sorted by case_id, fieldnames=[case_id, deletion_status, steps_json]
+  Post-run: validate_output() called automatically unless --no-validate
+
+── src/explore.py ──────────────────────────────────────────────────────────────
+  Utility: prints shape, columns, dtypes, nulls, first 10 rows,
+           low-cardinality unique values for every CSV in dataset/
+  Also: lists evidence files by extension with counts, joins evidence_files.csv
+  Usage: python src/explore.py --dataset dataset/
+
+================================================================================
+4. DATASET SUMMARY
+================================================================================
+
+deletion_requests.csv
+  518 rows x 5 cols
+  Columns : case_id, email, request_text, requested_at, audit_at
+  case_id : CASE_0001 … CASE_0518 (all unique)
+  email   : 200 distinct users across 518 cases
+  request_text: 25 unique phrasings (15 deletion, 10 non-deletion)
+  requested_at: UTC timestamps 2023-01-01 to 2024-05-01
+  audit_at    : 7-60 days after requested_at
+
+identities.csv
+  200 rows x 8 cols
+  user_id : USR_00001 … USR_00200
+  Columns : user_id, name, email, phone, email_hash_md5,
+            email_hash_sha256, created_at, updated_at
+
+audit_log.csv
+  1,213 rows x 8 cols
+  Columns : audit_id, user_id, email, name, phone, event_type,
+            timestamp, details
+  event_type values (10 unique):
+    ACCOUNT_CLOSED, ACCOUNT_CREATED, DATA_EXPORT_REQUESTED,
+    DELETION_REQUESTED, EMAIL_CHANGED, LOGIN, ORDER_PLACED,
+    PASSWORD_RESET, PROFILE_UPDATED, SUBSCRIPTION_CHANGED
+
+system_activity.csv
+  711 rows x 10 cols
+  Columns : activity_id, user_id, system_id, resource_id, operation,
+            result, status, timestamp, started_at, ended_at
+  Operations: CREATE, UPDATE, DELETE, SYNC, BACKUP, EXPORT, DISABLE, RESTORE
+  Systems   : CRM, ORDER_MGMT, ANALYTICS, EMAIL_SVC, SUPPORT, BACKUP_SYS,
+              SEARCH_IDX, BILLING, DATA_WAREHOUSE, NOTIFICATION_SVC
+
+deletion_rules.csv
+  14 rows x 7 cols
+  Columns: system_id, resource_type, action, permitted_identifiers,
+           retention_days, tombstone_allowed, notes
+
+evidence_files.csv
+  50 rows x 5 cols
+  Columns: file_id, system_id, file_path, file_type, description
+  File types: JSON (12), CSV (11), TXT (10), PDF (10), DB (9)
+  Systems covered: all 10 systems
+
+evidence/ directory
+  50 files: .json, .csv, .txt, .db (SQLite), .pdf (placeholder)
+
+sample_requests.csv  : 30 rows (first 30 from deletion_requests.csv)
+sample_output.csv    : 30 rows (ground truth for sample cases)
+  status distribution: ~35% NOT_APPLICABLE, ~39% COMPLETE, ~26% INCOMPLETE
+
+================================================================================
+5. DELETION RULES INTERPRETATION
+================================================================================
+
+Rule 1  — DEFAULT (*): customer_record
+  Action: DELETE | Tombstone: No
+  All customer records deleted by default unless overridden by system-specific rule.
+
+Rule 2  — CRM: customer_record
+  Action: DELETE | Tombstone: YES (permitted)
+  CRM may keep a tombstone but MUST remove name, email, phone, email_hash.
+  Only user_id may remain.
+
+Rule 3  — ORDER_MGMT: order_record
+  Action: RETAIN_AS_IS | Permitted: order_id, amount | Retention: 2555 days (7 years)
+  Financial compliance. PII fields beyond order_id/amount must be redacted.
+
+Rule 4  — ORDER_MGMT: invoice
+  Action: RETAIN_AS_IS | Permitted: order_id, amount | Retention: 2555 days
+  Tax/accounting compliance — same as order records.
+
+Rule 5  — BILLING: invoice
+  Action: RETAIN_AS_IS | Permitted: order_id, amount | Retention: 2555 days
+  Legal/tax retention requirement.
+
+Rule 6  — ANALYTICS: analytics_event
+  Action: ANONYMIZE | Permitted: event_id, ts | Retention: 365 days
+  Event data anonymized; statistical value retained.
+
+Rule 7  — ANALYTICS: user_profile
+  Action: DELETE | Tombstone: No
+  Full deletion of analytics user profiles.
+
+Rule 8  — EMAIL_SVC: email_log
+  Action: DELETE | Tombstone: No
+  Email logs fully deleted on request.
+
+Rule 9  — SUPPORT: support_ticket
+  Action: REDACT | Permitted: ticket_id | Retention: 730 days (2 years)
+  Support tickets redacted; ticket_id retained for operational continuity.
+
+Rule 10 — BACKUP_SYS: backup_snapshot
+  Action: DELETE | Tombstone: No
+  Backup snapshots containing user data must be purged.
+
+Rule 11 — SEARCH_IDX: search_index
+  Action: DELETE | Tombstone: No
+  Search index entries removed.
+
+Rule 12 — DATA_WAREHOUSE: analytics_event
+  Action: ANONYMIZE | Permitted: event_id | Retention: 730 days
+  DW event data anonymized.
+
+Rule 13 — DATA_WAREHOUSE: user_profile
+  Action: DELETE | Tombstone: No
+  DW user profiles deleted.
+
+Rule 14 — NOTIFICATION_SVC: notification_pref
+  Action: DELETE | Tombstone: No
+  Notification preferences deleted.
+
+SUMMARY:
+  RETAIN_AS_IS : ORDER_MGMT orders/invoices, BILLING invoices (financial law)
+  ANONYMIZE    : ANALYTICS events, DATA_WAREHOUSE events
+  REDACT       : SUPPORT tickets (keep ticket_id only)
+  DELETE       : Everything else
+
+================================================================================
+6. PIPELINE WALK-THROUGH (STEP-BY-STEP)
+================================================================================
+
+EXAMPLE: CASE_0003 — "I want to erase all my data from your systems immediately."
+Email: wendy.scott90@northstar.io
+
+STEP 1 — Intent Classification (intent.py)
+  Stage 1: positive patterns match: ["\berase\b.*\b(my|all|account|data)\b"]
+           negative patterns: none
+  Result: is_deletion=True, confidence=0.95, reason="positive pattern matched"
+  → Proceed to identity resolution
+
+STEP 2 — Identity Resolution (identity.py)
+  Normalise email: wendy.scott90@northstar.io (already lowercase)
+  Match in identities.csv → user_id=USR_00003
+  current_identifiers:
+    emails: ["wendy.scott90@northstar.io"]
+    phones: ["+1XXXXXXXXXX"]
+    names:  ["Wendy Scott"]
+  Compute hashes:
+    MD5:    <md5 of email>
+    SHA-256:<sha256 of email>
+    SHA-1:  <sha1 of email>
+  Enrich from audit_log:
+    Found 4 audit_log rows for USR_00003
+    historical_identifiers: emails/phones/names from log
+    source_ids: [AUD_XXXXXX, ...]
+  Reassignment check: email appears only under USR_00003 → ambiguous=False
+  all_identifiers: {email, phone, name, MD5, SHA256, SHA1}
+
+STEP 3 — Evidence Search (evidence.py)
+  Scan all 50 evidence files for any identifier in all_identifiers
+  ev_0021.csv (CRM): match on email → resource_id=customer_record_USR_00003
+  ev_0005.txt (CRM): match on name  → resource_id=0 (line number)
+  ev_0006.json (DATA_WAREHOUSE): match on email → resource_id=0
+  Result: 3 EvidenceMatch records
+
+STEP 4 — State Reconstruction (state.py)
+  Filter activity rows: user_id=USR_00003 AND ts <= audit_at
+  Replay chronologically:
+    [2023-06-01] CRM/customer_record_USR_00003: CREATE → PRESENT
+    [2023-08-15] CRM/customer_record_USR_00003: DELETE → claimed ABSENT
+       cross-check: ev_0021.csv still shows email → override to PRESENT
+  resource_states:
+    (CRM, customer_record_USR_00003) → PRESENT (deletion claimed but evidence contradicts)
+    (DATA_WAREHOUSE, user_profile_USR_00003) → PRESENT (from evidence)
+  active_flows: [] (no SYNC jobs active at audit_at)
+  restore_risks: [(BACKUP_SYS, backup_snapshot_USR_00003, ACT_XXXXXXX)]
+
+STEP 5 — Rules Evaluation (rules.py)
+  (CRM, customer_record_USR_00003):
+    resource_type = "customer_record"
+    Rule: DELETE, tombstone_allowed=True
+    State: PRESENT → REMAINING_RECORD gap
+    Tombstone check: email field present → EXPOSED_PII gap
+  (DATA_WAREHOUSE, user_profile_USR_00003):
+    resource_type = "user_profile"
+    Rule: DELETE
+    State: PRESENT → REMAINING_RECORD gap
+  restore_risk → RESTORE_RISK gap
+  Gaps: [REMAINING_RECORD(CRM), EXPOSED_PII(CRM), REMAINING_RECORD(DW), RESTORE_RISK(BACKUP)]
+  deletion_status: INCOMPLETE
+
+STEP 6 — Build Steps (steps.py)
+  For REMAINING_RECORD(CRM):
+    FINDING:     REPORT_REMAINING_RECORD / PRESENT / evidence_id=ACT_CRM_XXX
+    REMEDIATION: DELETE_RECORD / ABSENT / evidence_id=""
+    VERIFICATION:VERIFY_RECORD_ABSENT / ABSENT / evidence_id=""
+  For EXPOSED_PII(CRM):
+    FINDING:     REPORT_EXPOSED_PII / PRESENT / evidence_id=ACT_CRM_XXX
+    REMEDIATION: REDACT_RECORD / REDACTED / evidence_id=""
+    VERIFICATION:VERIFY_RECORD_REDACTED / REDACTED / evidence_id=""
+  For REMAINING_RECORD(DW):
+    FINDING:     REPORT_REMAINING_RECORD / PRESENT / evidence_id=ACT_DW_XXX
+    REMEDIATION: DELETE_RECORD / ABSENT / evidence_id=""
+    VERIFICATION:VERIFY_RECORD_ABSENT / ABSENT / evidence_id=""
+  For RESTORE_RISK:
+    FINDING:     REPORT_RESTORE_RISK / ACTIVE / evidence_id=ACT_BAK_XXX
+    REMEDIATION: BLOCK_RESTORE / BLOCKED / evidence_id=""
+    VERIFICATION:VERIFY_RESTORE_BLOCKED / BLOCKED / evidence_id=""
+  Sort: FINDING ops → REMEDIATION ops → VERIFICATION ops
+  Renumber: step_no 1..12
+  Result: 12 steps total
+
+STEP 7 — Validate (validate.py)
+  All 12 checks pass → output written to output.csv
+
+EXAMPLE: CASE_0001 — "I'm just checking in — no action required on my account."
+
+STEP 1 — Intent Classification
+  Stage 1: negative pattern matches: ["\bjust\s+(asking|wondering|checking)\b"]
+           no positive patterns
+  Result: is_deletion=False, confidence=0.95
+  → NOT_APPLICABLE immediately
+
+OUTPUT: case_id=CASE_0001, deletion_status=NOT_APPLICABLE, steps_json=[]
+
+================================================================================
+7. DESIGN DECISIONS & RATIONALE
+================================================================================
+
+DECISION 1: Two-Stage Intent Classifier
+  Problem: LLM calls are slow and costly at scale (518 cases).
+  Solution: Stage-1 regex (deterministic, <1ms) handles ~90% of cases.
+            Stage-2 LLM only for ambiguous or conflicting signals.
+  Benefit: Estimated 10x reduction in LLM token spend.
+  Evidence threshold: 0.80 (configurable in config.yaml).
+
+DECISION 2: Evidence Cross-Check on DELETE Claims
+  Problem: The activity log may show a DELETE event, but the record might still
+           exist (failed deletion, sync recreated it, or backup restored it).
+  Solution: After replaying DELETE events, check all EvidenceMatch records.
+            If evidence shows the identifier still present → override to PRESENT.
+  Rationale: "reported_status and operation success are claims, not proof."
+
+DECISION 3: Historical Identifier Resolution
+  Problem: User may have changed their email. Request may come from old email.
+           Hash variants (MD5/SHA-256/SHA-1) may appear in evidence files.
+  Solution: audit_log enriches the IdentityBundle with historical emails/names.
+            All hash variants computed and included in all_identifiers set.
+  Edge case: Email reassigned to different user → flag as ambiguous, resolve
+             by timestamp to correct owner.
+
+DECISION 4: Tombstone-Aware Gap Detection
+  Problem: CRM tombstones are allowed to keep user_id but not PII.
+  Solution: TOMBSTONE_FORBIDDEN = {name, email, phone, email_hash, ...}
+            Evidence fields checked against this set.
+            Any forbidden field found → EXPOSED_PII gap → must REDACT.
+
+DECISION 5: Disk Cache for LLM + Evidence Text
+  Problem: Multiple runs, multiple workers, same LLM prompts.
+  Solution: SHA-256 content-addressable cache for LLM responses.
+            Parsed text (PDF OCR, image OCR) also cached by filename.
+  Benefit: Second run is essentially free for LLM calls.
+
+DECISION 6: Per-Case Error Isolation
+  Problem: One bad evidence file or unexpected schema should not kill all 518 cases.
+  Solution: ThreadPoolExecutor catches per-case exceptions; logs them;
+            emits INCOMPLETE + empty steps as safe fallback.
+
+DECISION 7: Column Name Flexibility in rules.py
+  Problem: Real CSVs may have slightly different column names.
+  Solution: rules.py normalises all column names to lowercase and checks
+            aliases (e.g., "action" OR "deletion_action" OR "treatment").
+
+DECISION 8: Parallelism with Thread Safety Awareness
+  Problem: ThreadPoolExecutor + shared JSONL log file.
+  Note: llm_calls.jsonl uses open(..., "a") per call. In parallel, lines may
+        interleave between workers but each json.dumps() call is atomic at the
+        OS level for small payloads. Acceptable for competition context.
+
+================================================================================
+8. TEST RESULTS
+================================================================================
+
+Platform: Windows, Python 3.13.13, pytest 9.1.1
+
+  tests/test_intent.py     22 tests  — 22 PASSED  (100%)
+  tests/test_load_data.py   6 tests  —  6 PASSED  (100%)
+  tests/test_steps.py      10 tests  — 10 PASSED  (100%)
+  tests/test_validate.py    9 tests  —  9 PASSED  (100%)
+
+  TOTAL: 47 tests — 47 PASSED — 0 FAILED — 0 SKIPPED
+
+  Duration: 1.71 seconds
+
+Test highlights:
+
+  test_intent.py:
+    19 parametrised cases (10 positive deletion + 9 non-deletion)
+    Covers: empty text, null text, negation override, export vs. delete,
+            GDPR/CCPA phrases, purge/wipe/erase, right-to-be-forgotten
+
+  test_load_data.py:
+    - deletion_requests.csv has exactly 518 rows
+    - No duplicate case_ids
+    - All requested_at <= audit_at
+    - Email columns are lowercase after normalisation
+    - sample_output.csv has required columns
+
+  test_steps.py:
+    - NOT_APPLICABLE returns []
+    - COMPLETE has only VERIFICATION steps
+    - COMPLETE evidence_id is non-empty
+    - step_no starts at 1 and is consecutive
+    - INCOMPLETE FINDING steps have evidence_id
+    - INCOMPLETE REMEDIATION/VERIFICATION have empty evidence_id
+    - Phase order: FINDING → REMEDIATION → VERIFICATION
+    - Duplicate steps are de-duplicated
+    - to_csv_row() produces valid JSON
+
+  test_validate.py:
+    Valid cases:  NOT_APPLICABLE, COMPLETE, INCOMPLETE all pass
+    Broken cases:
+      - Wrong header → HEADER error
+      - Missing case → MISSING error
+      - Invalid deletion_status → deletion_status error
+      - COMPLETE with FINDING step → COMPLETE error
+      - COMPLETE step with empty evidence_id → evidence_id error
+      - INCOMPLETE FINDING with empty evidence_id → evidence_id error
+
+python src/main.py --help: exits 0 (verified)
+
+================================================================================
+9. LLM STRATEGY
+================================================================================
+
+MODEL: claude-claude-sonnet-4-5 (configurable in config.yaml)
+
+WHEN LLM IS CALLED:
+  (a) Intent Stage-2:
+      Trigger: regex confidence < 0.80 OR conflicting signals
+      Prompt:  prompts/intent.txt — single-turn, strict JSON output
+      Expected tokens: ~150 input, ~30 output
+      Cache hit rate: ~100% after first run (same texts repeat)
+
+  (b) Evidence extraction from unstructured text (PDF/image):
+      Trigger: pdfplumber returns empty text (scanned PDF)
+      Prompt:  prompts/evidence_extraction.txt — {{IDENTIFIERS}} + {{DOCUMENT_TEXT}}
+      Expected tokens: varies by document length
+      Cache: text result cached by filename to .cache/evidence/
+
+  (c) Vision extraction from images:
+      Trigger: pytesseract avg confidence < 60
+      Prompt:  prompts/vision_extract.txt — {{IDENTIFIERS}}
+      Method:  base64-encoded image sent to Anthropic vision API
+      Output:  {"found": ["value1", ...]}
+
+COST ESTIMATION (worst case, no cache):
+  Intent LLM: ~200 cases ambiguous x 180 tokens = 36,000 tokens
+  Evidence:   ~10 PDFs with OCR x 500 tokens = 5,000 tokens
+  Total input tokens: ~41,000 (~$0.12 at $3/MTok)
+  Total output tokens: ~15,000 (~$0.23 at $15/MTok)
+  Estimated total cost: < $0.40 per full run
+
+LOGGING:
+  Every call logged to evaluation/llm_calls.jsonl:
+  {"ts":"...","model":"...","prompt_tokens":N,"completion_tokens":N,
+   "total_tokens":N,"latency_ms":N,"cache_hit":false}
+  Report: python evaluation/make_usage_report.py
+
+================================================================================
+10. OUTPUT FORMAT SPECIFICATION
+================================================================================
+
+output.csv:
+  - UTF-8, comma-separated
+  - Header: case_id,deletion_status,steps_json
+  - Exactly 518 rows (one per case in deletion_requests.csv)
+  - Sorted by case_id ascending
+  - steps_json: JSON array ([] for NOT_APPLICABLE)
+
+STEP OBJECT:
+  {
+    "step_no":     1,
+    "phase":       "FINDING",
+    "system_id":   "CRM",
+    "resource_id": "customer_record_USR_00042",
+    "operation":   "REPORT_REMAINING_RECORD",
+    "state":       "PRESENT",
+    "evidence_id": "FILE_0021"
+  }
+
+EVIDENCE_ID SOURCES:
+  COMPLETE steps:   real activity_id (e.g., "ACT_0012345") or file_id ("FILE_0021")
+  INCOMPLETE FINDING: file_id or activity_id that proves the gap
+  INCOMPLETE REMEDIATION: "" (empty string)
+  INCOMPLETE VERIFICATION: "" (empty string)
+  NOT_APPLICABLE: steps_json = []
+
+================================================================================
+11. KNOWN LIMITATIONS & EDGE CASES
+================================================================================
+
+1. PDF FILES
+   The evidence/ directory contains placeholder .pdf files (not real PDFs).
+   Real competition PDFs will be handled by pdfplumber + pytesseract OCR.
+   If OCR fails, vision LLM is invoked automatically.
+
+2. RESOURCE_TYPE INFERENCE
+   rules.py infers resource_type from system_id/resource_id name heuristics.
+   Once real deletion_rules.csv columns are known, this can be exact-matched.
+   Fallback: "record" type, treated as DELETE by default.
+
+3. REASSIGNED EMAILS
+   If an email was owned by user A until 2022-01-01 and then user B after,
+   the agent resolves to the correct owner based on requested_at timestamp
+   and logs an ambiguity warning. Both users' records are checked.
+
+4. THREAD SAFETY OF JSONL LOG
+   LLM call log uses open("a") — safe for single-threaded, but in multi-worker
+   mode, log lines from different threads may interleave within a single write
+   buffer. In practice, each line is small enough to be written atomically.
+
+5. ACTIVITY LOG TIMESTAMP COLUMN
+   state.py expects a "timestamp" column. If the real CSV uses a different name
+   (e.g., "created_at", "event_time"), _filter_activity will not apply the time
+   filter. Mitigation: load_data.py TIMESTAMP_COLS registry is updated with
+   real column names once known.
+
+6. NOT_APPLICABLE DEFAULT ON LLM FAILURE
+   If the LLM fails (no API key, network error) and Stage-1 confidence < 0.80,
+   the agent returns Stage-1 result with "[LLM unavailable]" in the reason.
+   General conflicts default to is_deletion=False (safe/conservative).
+
+7. BILLING/TAX RECORD PII
+   Retained ORDER_MGMT/BILLING records are allowed to keep order_id and amount
+   only. If evidence shows email or name in these records, an EXPOSED_PII gap
+   is generated even though the record itself is retained.
+
+================================================================================
+12. FILE LISTING
+================================================================================
+
+ghost-audit/
+  .gitignore
+  config.yaml                        Central config (paths, model, pricing, threshold)
+  package.sh                         Submission packager (secrets scan + zip)
+  README.md                          Setup and architecture documentation
+  requirements.txt                   pandas, pdfplumber, pytesseract, pyyaml,
+                                     anthropic, tqdm, pytest
+  generate_dataset.py                Synthetic dataset generator
+
+  src/
+    main.py          282 lines       CLI entry point, ThreadPoolExecutor pipeline
+    llm.py           184 lines       Anthropic wrapper, SHA-256 cache, JSONL log
+    load_data.py     153 lines       CSV loader, normaliser, DataBundle
+    intent.py        204 lines       Two-stage intent classifier
+    identity.py      305 lines       Identity resolver, hash variants
+    evidence.py      414 lines       Multi-format evidence parser
+    state.py         269 lines       Activity log replayer
+    rules.py         335 lines       Policy engine, gap detector
+    steps.py         284 lines       Step builder, sorter, serialiser
+    validate.py      265 lines       12-rule output validator
+    explore.py       123 lines       Dataset explorer utility
+
+  prompts/
+    intent.txt                       Stage-2 LLM intent classification template
+    evidence_extraction.txt          LLM text evidence extraction template
+    vision_extract.txt               Vision LLM identifier extraction template
+
+  evaluation/
+    evaluate.py                      Status accuracy, step P/R/F1, LCS scoring
+    make_usage_report.py             LLM call log → usage_report.md
+    extra_cases/
+      synth_001_complete.json        COMPLETE case: all records deleted, no flows
+      synth_002_incomplete_remaining.json  INCOMPLETE: CRM record still present
+      synth_003_not_applicable_export.json NOT_APPLICABLE: data export request
+      synth_004_incomplete_active_flow.json INCOMPLETE: active SYNC job
+      synth_005_incomplete_tombstone_pii.json INCOMPLETE: tombstone exposes email
+
+  tests/
+    __init__.py
+    test_intent.py                   22 tests — intent classifier
+    test_load_data.py                 6 tests — data loading & normalisation
+    test_steps.py                    10 tests — step builder & serialiser
+    test_validate.py                  9 tests — output validation (3 valid, 6 broken)
+
+  dataset/
+    deletion_requests.csv           518 rows
+    sample_requests.csv              30 rows
+    sample_output.csv                30 rows (ground truth)
+    identities.csv                  200 rows
+    audit_log.csv                 1,213 rows
+    system_activity.csv             711 rows
+    deletion_rules.csv               14 rows
+    evidence_files.csv               50 rows
+    evidence/                        50 files (.json, .csv, .txt, .db, .pdf)
+
+================================================================================
+END OF LOG
+================================================================================
+  Project   : ghost-audit (Northstar Shop Deletion Audit Agent)
+  Status    : COMPLETE SKELETON — 47/47 tests passing
+  python src/main.py --help : exits 0
+  Next step : python src/main.py --input dataset/deletion_requests.csv
+                               --output output/output.csv
+================================================================================
