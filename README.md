@@ -10,14 +10,14 @@ case_id, deletion_status, steps_json
 ```
 `deletion_status` ∈ `{COMPLETE | INCOMPLETE | NOT_APPLICABLE}`
 
-## Setup
+### Setup
 ```bash
 pip install -r requirements.txt
 # Set your Anthropic API key (never stored in config.yaml)
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-## Quick Start
+###Quick Start
 ```bash
 # Audit all 518 cases
 python src/main.py --input dataset/deletion_requests.csv --output output.csv
